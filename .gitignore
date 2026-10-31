@@ -21,7 +21,7 @@ Thumbs.db
 .idea/
 
 data/downloaded_petitions/
-TODO.txt
+TO_DO.docx
 notebooks/
 v1/
 data/embeddings_v1.pt
