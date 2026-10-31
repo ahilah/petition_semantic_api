@@ -1,0 +1,11 @@
+fastapi==0.110.0
+uvicorn==0.28.0
+pydantic==2.6.4
+pandas==2.2.3
+numpy==1.26.4
+torch==2.6.0
+torchvision==0.21.0
+sentence-transformers==2.5.1
+transformers>=4.48.0
+spacy==3.7.4
+fpdf2==2.7.7

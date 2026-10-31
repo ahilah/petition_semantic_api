@@ -1,0 +1,27 @@
+# Віртуальне середовище Python
+venv/
+env/
+ENV/
+.venv/
+
+# Кеш Python та компільовані файли
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Важкі файли даних 
+data/coords_cache.json
+
+# Системні файли та редактори кодів
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+data/downloaded_petitions/
+TODO.txt
+notebooks/
+v1/
+data/embeddings_v1.pt
