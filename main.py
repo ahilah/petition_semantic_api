@@ -17,11 +17,14 @@ from reports import export_to_csv, export_to_pdf
 from engine import DomainContextEngine
 from database import init_db, log_petition_check, get_system_analytics, log_expert_feedback
 
-# 1. Налаштування логування для моніторингу роботи сервера
+# 1. Налаштування логування для виведення в консоль ТА у файл app.log
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[
+        logging.StreamHandler(),                  # Вивід у термінал 
+        logging.FileHandler("app.log", encoding="utf-8")  # Запис у файл
+    ]
 )
 logger = logging.getLogger("PetitionAPI")
 

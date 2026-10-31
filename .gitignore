@@ -25,3 +25,9 @@ TO_DO.docx
 notebooks/
 v1/
 data/embeddings_v1.pt
+data/labeled/ground_truth_for_labeling.csv
+data/labeled/ground_truth_for_labeling.xlsx
+data/labeled/ground_truth_300.xlsx
+data/raw/all_petitions_merged.csv
+data/petitions_preprocessed.csv
+

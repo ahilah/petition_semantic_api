@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  petition-api:
+    build: .
+    container_name: petition_semantic_service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data  # Зберігає базу даних SQLite та корпус за межами контейнера
+      - ./assets:/app/assets # Зберігає шрифти для PDF-звітів
+    restart: unless-stopped
