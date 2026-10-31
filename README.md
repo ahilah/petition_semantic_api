@@ -1,4 +1,4 @@
-# Municipal E-Petition Semantic Similarity & Deduplication System
+# Municipal E-Petition Semantic Similarity & Deduplication API
 
 <p align="center">
   <b>Master's Thesis Project | Lviv Polytechnic National University</b><br>
@@ -8,9 +8,10 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python Version">
-  <img src="https://img.shields.io/badge/Streamlit-App-red.svg" alt="Streamlit">
+  <img src="https://img.shields.io/badge/FastAPI-REST%20API-teal.svg" alt="FastAPI">
   <img src="https://img.shields.io/badge/PyTorch-Deep%20Learning-orange.svg" alt="PyTorch">
   <img src="https://img.shields.io/badge/spaCy-NLP-green.svg" alt="spaCy">
+  <img src="https://img.shields.io/badge/SQLite-Persistence-lightgrey.svg" alt="SQLite">
   <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License">
 </p>
 
@@ -20,54 +21,55 @@
 
 This project is developed as a Master's qualification thesis focusing on the automated detection of semantic similarity between electronic petitions and the identification of duplicate or closely related civic initiatives. 
 
-The system implements a **Two-Stage Retrieval** architecture combining dense semantic vector embeddings (`intfloat/multilingual-e5-small`) with a custom domain-specific rule engine (`DomainContextEngine`) and continuous geospatial distance validation (Haversine formula) to prevent false-positive duplicate flags in municipal governance platforms.
+The system implements a robust **Two-Stage Retrieval** architecture combining dense semantic vector embeddings (`intfloat/multilingual-e5-small`) with a custom domain-specific rule engine (`DomainContextEngine`), continuous geospatial distance validation (Haversine formula), relational persistence (SQLite), and unsupervised machine learning modules for municipal governance platforms.
 
 ---
 
 ## Key Features
 
 - **Semantic Deduplication:** Vector-based similarity search across active municipal petition corpora using PyTorch and Sentence-Transformers.
-- **Domain Context Engine:** Advanced Named Entity Recognition (NER) and EntityRuler integration via `spaCy` (`uk_core_news_lg`) to isolate specific entities (schools, routes, streets, quotes) and domain categories (roads, education, ecology, housing).
-- **Geospatial Verification:** Automatic coordinate extraction and continuous Haversine distance penalty calculation to filter out geographically distant initiatives.
-- **Analytical Dashboard:** Interactive Plotly charts visualizing thematic categories, municipal activity ratings, and temporal activity distributions.
+- **Batch Processing API:** Mass validation endpoint for simultaneous processing of administrative petition batches.
+- **Unsupervised Semantic Clustering:** K-Means clustering (`scikit-learn`) over vector embeddings to uncover latent civic topics and trends in real-time.
+- **Active Learning (Human-in-the-Loop):** Expert feedback loop allowing municipal moderators to confirm duplicates and build a verified Ground Truth corpus.
+- **Geospatial GeoJSON Export:** Spatial data structuring for instant integration with GIS mapping tools (Leaflet/Folium).
+- **SQLite Audit & Telemetry:** Built-in relational logging of system performance, query metrics, latency, and verification verdicts.
+- **Dual-Channel Logging:** Comprehensive event tracking into both console streams and file logs (`app.log`).
 - **Automated Audit Reporting:** Generation of official review protocols and audit reports in CSV and PDF formats (`fpdf2`).
 
 ---
 
 ## Technology Stack
 
-- **Frontend & UI:** Streamlit, Streamlit-Folium, Plotly
+- **Backend Framework:** FastAPI, Uvicorn, Pydantic
 - **NLP & Embeddings:** Sentence-Transformers (`intfloat/multilingual-e5-small`), spaCy (`uk_core_news_lg`)
-- **Machine Learning & Core:** PyTorch, Pandas, NumPy, Scikit-learn
-- **Geospatial & Mapping:** Folium, OpenStreetMap Nominatim API
-- **Reporting:** FPDF2 (PDF generation)
+- **Machine Learning & Analytics:** PyTorch, Scikit-learn (K-Means), Pandas, NumPy
+- **Database & Storage:** SQLite (Telemetry & Feedback persistence)
+- **Geospatial & Reporting:** Haversine formula, GeoJSON, FPDF2 (PDF generation)
 
 ---
 
 ## Project Structure
 
 ```text
-masters-thesis/
+petition_semantic_api/
 │
-├── assets/                 # Custom CSS styles and graphical resources
-│   └── style.css
+├── assets/                 # Graphical resources and fonts for PDF reports
+│   └── DejaVuSans.ttf
 │
-├── data/                   # Cleaned datasets, serialized embeddings, and caches
+├── data/                   # Corpora, serialized embeddings, and SQLite database
 │   ├── petitions_cleaned.csv
 │   ├── embeddings.pt
-│   └── coords_cache.json
+│   └── petition_analytics.db
 │
-├── notebooks/              # Experimental scripts and EDA notebooks
-│   └── ...
-│
-├── app.py                  # Main Streamlit web application entry point
-├── engine.py               # Domain context engine, NER rules, and entity extraction
+├── main.py                 # FastAPI application and core API endpoints
+├── database.py             # SQLite persistence, telemetry, and analytics queries
 ├── matcher.py              # Two-stage retrieval and semantic search pipeline
+├── engine.py               # Domain context engine, NER rules, and entity extraction
 ├── geocoding.py            # Geocoding utilities and Haversine distance calculations
-├── mapping.py              # Folium map and heatmap generator
 ├── reports.py              # CSV and PDF audit protocol generator
-├── ui_components.py        # HTML/CSS template cards for UI rendering
-├── validation.py           # Input text validation logic
+├── validation.py           # Input text validation and anti-spam logic
+├── Dockerfile              # Containerization configuration
+├── docker-compose.yml      # Multi-container orchestration setup
 └── requirements.txt        # Project dependencies
 ```
 
@@ -77,8 +79,8 @@ masters-thesis/
 ### 1. Clone the Repository
 
 ```bash
-git clone [https://github.com/your-username/municipal_petition_similarity.git](https://github.com/your-username/municipal_petition_similarity.git)
-cd municipal_petition_similarity
+git clone [https://github.com/your-username/petition_semantic_api.git](https://github.com/your-username/petition_semantic_api.git)
+cd petition_semantic_api
 ```
 
 ---
@@ -112,12 +114,12 @@ python -m spacy download uk_core_news_lg
 To launch the interactive municipal monitoring web interface, run:
 
 ```bash
-streamlit run app.py
+uvicorn main:app --reload
 ```
 
-Open your browser and navigate to 
+Open your browser and navigate to the interactive Swagger UI documentation:
 ```text
-http://localhost:8501.
+http://localhost:8000/docs
 ```
 
 ---
