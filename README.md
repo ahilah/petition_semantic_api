@@ -79,7 +79,7 @@ petition_semantic_api/
 ### 1. Clone the Repository
 
 ```bash
-git clone [https://github.com/your-username/petition_semantic_api.git](https://github.com/your-username/petition_semantic_api.git)
+git clone https://github.com/ahilah/petition_semantic_api
 cd petition_semantic_api
 ```
 
