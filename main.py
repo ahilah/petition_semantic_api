@@ -1,42 +1,79 @@
-import time
 import logging
+import time
+from contextlib import asynccontextmanager
+from typing import List, Optional
+
 import pandas as pd
 import torch
-
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Response, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
 
-#  наявних модулів системи
+from database import get_system_analytics, init_db, log_expert_feedback, log_petition_check
+from engine import (
+    DEFAULT_THRESHOLD_DUPLICATE,
+    DEFAULT_THRESHOLD_REVIEW,
+    DEFAULT_W_DOM,
+    DEFAULT_W_GEOD,
+    DEFAULT_W_SEM,
+)
 from matcher import load_system_core, search_similar_petitions
-from validation import is_valid_input_text
 from reports import export_to_csv, export_to_pdf
-from engine import DomainContextEngine
-from database import init_db, log_petition_check, get_system_analytics, log_expert_feedback
+from validation import is_valid_input_text
+
+DEFAULT_CONFIDENCE_FLOOR = 0.60
 
 # 1. Налаштування логування для виведення в консоль ТА у файл app.log
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.StreamHandler(),                  # Вивід у термінал 
-        logging.FileHandler("app.log", encoding="utf-8")  # Запис у файл
-    ]
+        logging.StreamHandler(),
+        logging.FileHandler("app.log", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger("PetitionAPI")
 
-# 2. Ініціалізація FastAPI додатку 
+# 2. Глобальні змінні для завантаження ML-ядра в пам'ять при старті
+df_corpus: Optional[pd.DataFrame] = None
+model: Optional[SentenceTransformer] = None
+corpus_embeddings: Optional[torch.Tensor] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Життєвий цикл сервера: одноразове завантаження БД, датасету,
+    трансформерної моделі Multilingual-E5 та серіалізованих ембедингів.
+    """
+    init_db()
+
+    global df_corpus, model, corpus_embeddings
+    logger.info("⏳ Ініціалізація ML-ядра та завантаження корпусу петицій...")
+    try:
+        df_corpus, model, corpus_embeddings = load_system_core()
+        logger.info(f"✅ Успішно завантажено записів у корпусі: {len(df_corpus):,}".replace(",", " "))
+        logger.info(f"✅ Модель SentenceTransformer активовано. Формат ембедингів: {corpus_embeddings.shape}")
+    except Exception as e:
+        logger.error(f"Критична помилка під час завантаження системного ядра: {e}")
+        df_corpus, model, corpus_embeddings = None, None, None
+
+    yield
+
+
+# 3. Ініціалізація FastAPI додатку
 app = FastAPI(
     title="Municipal Petition Semantic & Deduplication API",
     description=(
-        "Високопродуктивний мікросервіс на базі FastAPI для автоматизованого семантичного зіставлення, дедуплікації та геопросторової верифікації електронних петицій. "
+        "Високопродуктивний мікросервіс на базі FastAPI для автоматизованого семантичного зіставлення, "
+        "дедуплікації та геопросторової верифікації електронних петицій."
     ),
     version="2.1.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # Додаємо CORS для безшовної інтеграції з будь-якими сайтами ОМС
@@ -48,41 +85,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 3. Глобальні змінні для завантаження ML-ядра в пам'ять при старті
-df_corpus: Optional[pd.DataFrame] = None
-model: Optional[SentenceTransformer] = None
-corpus_embeddings: Optional[torch.Tensor] = None
-
-
-@app.on_event("startup")
-def startup_event():
-    """
-    Подія при запуск сервера: одноразове завантаження датасету, 
-    трансформерної моделі Multilingual-E5 та серіалізованих ембедингів.
-    """
-    init_db()
-    
-    global df_corpus, model, corpus_embeddings
-    logger.info("⏳ Ініціалізація ML-ядра та завантаження корпусу петицій...")
-    try:
-        df_corpus, model, corpus_embeddings = load_system_core()
-        logger.info(f"✅ Успішно завантажено записів у корпусі: {len(df_corpus):,}".replace(",", " "))
-        logger.info(f"✅ Модель SentenceTransformer активовано. Формат ембедингів: {corpus_embeddings.shape}")
-    except Exception as e:
-        logger.error(f"❌ Критична помилка під час завантаження системного ядра: {e}")
-        df_corpus, model, corpus_embeddings = None, None, None
-
 
 # 4. Pydantic-схеми для валідації вхідних та вихідних даних
 class PetitionCheckRequest(BaseModel):
-    title: str = Field(..., description="Заголовок нової петиції", min_length=3, example="Ремонт дорожнього покриття на вулиці Шевченка")
-    body: str = Field("", description="Повний текст звернення громадян", example="Просимо терміново провести ямковий ремонт...")
-    authority: str = Field("Всі юрисдикції (Національний рівень)", description="Цільовий орган місцевого самоврядування (ОМС)")
+    title: str = Field(
+        ...,
+        description="Заголовок нової петиції",
+        min_length=3,
+        example="Ремонт дорожнього покриття на вулиці Шевченка",
+    )
+    body: str = Field(
+        "",
+        description="Повний текст звернення громадян",
+        example="Просимо терміново провести ямковий ремонт...",
+    )
+    authority: str = Field(
+        "Всі юрисдикції (Національний рівень)",
+        description="Цільовий орган місцевого самоврядування (ОМС)",
+    )
     strict_mode: bool = Field(True, description="Сувора ізоляція юрисдикції громади")
     top_k: int = Field(5, description="Кількість найбільш схожих кандидатів для видачі", ge=1, le=10)
-    threshold_duplicate: float = Field(0.88, description="Поріг класифікації як прямий дублікат", ge=0.5, le=1.0)
-    threshold_review: float = Field(0.76, description="Поріг для направлення на ручну модерацію", ge=0.4, le=0.9)
-    confidence_floor: float = Field(0.60, description="Поріг відсікання фонового шуму", ge=0.3, le=0.8)
+    threshold_duplicate: float = Field(
+        DEFAULT_THRESHOLD_DUPLICATE,
+        description="Поріг класифікації як прямий дублікат",
+        ge=0.5,
+        le=1.0,
+    )
+    threshold_review: float = Field(
+        DEFAULT_THRESHOLD_REVIEW,
+        description="Поріг для направлення на ручну модерацію",
+        ge=0.4,
+        le=0.9,
+    )
+    confidence_floor: float = Field(
+        DEFAULT_CONFIDENCE_FLOOR,
+        description="Поріг відсікання фонового шуму",
+        ge=0.3,
+        le=0.8,
+    )
+    w_sem: float = Field(DEFAULT_W_SEM, description="Вага компонента семантичної близькості", ge=0.0, le=1.0)
+    w_dom: float = Field(DEFAULT_W_DOM, description="Вага компонента доменно-сутнісної перевірки (NER)", ge=0.0, le=1.0)
+    w_geod: float = Field(DEFAULT_W_GEOD, description="Вага компонента геопросторової близькості (Гаверсинус)", ge=0.0, le=1.0)
 
 
 class MatchItem(BaseModel):
@@ -110,10 +153,10 @@ class PetitionCheckResponse(BaseModel):
 
 class BatchPetitionCheckRequest(BaseModel):
     petitions: List[PetitionCheckRequest] = Field(
-        ..., 
-        description="Масив петицій для пакетної перевірки (до 50 штук за раз)", 
-        min_items=1, 
-        max_items=50
+        ...,
+        description="Масив петицій для пакетної перевірки (до 50 штук за раз)",
+        min_length=1,
+        max_length=50,
     )
 
 
@@ -132,7 +175,6 @@ class BatchPetitionCheckResponse(BaseModel):
     total_processed: int
     total_latency_ms: float
     results: List[BatchItemResult]
-
 
 
 class ClusterInfo(BaseModel):
@@ -170,7 +212,7 @@ def read_root():
         "service": "Municipal Petition Semantic & Deduplication API",
         "corpus_loaded": df_corpus is not None,
         "total_records": len(df_corpus) if df_corpus is not None else 0,
-        "documentation": "/docs"
+        "documentation": "/docs",
     }
 
 
@@ -179,12 +221,12 @@ def get_authorities():
     """Повертає список усіх доступних органів місцевого самоврядування (ОМС) у базі."""
     if df_corpus is None:
         raise HTTPException(status_code=500, detail="Корпус даних не завантажено на сервері.")
-    
-    authorities = sorted([str(a) for a in df_corpus['authority'].dropna().unique()])
+
+    authorities = sorted([str(a) for a in df_corpus["authority"].dropna().unique()])
     return {
         "success": True,
         "count": len(authorities),
-        "authorities": authorities
+        "authorities": authorities,
     }
 
 
@@ -194,7 +236,7 @@ def check_petition_endpoint(payload: PetitionCheckRequest):
     Головний аналітичний ендпоїнт:
     1. Перевіряє вхідний текст на спам та валідність.
     2. Виконує двохетапний пошук (Two-Stage Retrieval) за допомогою Multilingual-E5.
-    3. Застосовує доменно-контекстний рушій (DomainContextEngine) та геопросторовий штраф Гаверсинуса.
+    3. Застосовує доменно-контекстний рушій (DomainContextEngine) та геопросторовий коефіцієнт Гаверсинуса у зваженій інтегральній оцінці.
     4. Повертає структурований JSON з вердиктом та аргументами.
     """
     if df_corpus is None or model is None or corpus_embeddings is None:
@@ -215,13 +257,13 @@ def check_petition_endpoint(payload: PetitionCheckRequest):
             "matches_count": 0,
             "latency_ms": round((time.perf_counter() - start_time) * 1000, 1),
             "candidates_evaluated": 0,
-            "similar_petitions": []
+            "similar_petitions": [],
         }
 
     # 2. Формування повного запиту
     full_query = f"{payload.title.strip()}. {payload.body.strip()}".strip()
 
-    # 3. Виконання пошуку та переранжування
+    # 3. Виконання пошуку та зваженого переранжування
     try:
         results_df = search_similar_petitions(
             query_text=full_query,
@@ -232,21 +274,22 @@ def check_petition_endpoint(payload: PetitionCheckRequest):
             strict_mode=payload.strict_mode,
             top_k=payload.top_k,
             threshold_duplicate=payload.threshold_duplicate,
-            threshold_review=payload.threshold_review
+            threshold_review=payload.threshold_review,
+            w_sem=payload.w_sem,
+            w_dom=payload.w_dom,
+            w_geod=payload.w_geod,
         )
     except Exception as e:
-        logger.exception("❌ Помилка під час векторного інференсу або фільтрації")
+        logger.exception("Помилка під час векторного інференсу або фільтрації")
         raise HTTPException(status_code=500, detail=f"Помилка обробки запиту: {str(e)}")
 
     latency_ms = round((time.perf_counter() - start_time) * 1000, 1)
 
-    # Підрахунок кількості реально перевірених кандидатів у межах юрисдикції
     df_scope = df_corpus.copy()
     if payload.strict_mode and payload.authority != "Всі юрисдикції (Національний рівень)":
-        df_scope = df_scope[df_scope['authority'] == payload.authority]
+        df_scope = df_scope[df_scope["authority"] == payload.authority]
     candidates_count = len(df_scope)
 
-    # Безпечна ініціалізація змінних за замовчуванням (усуває попередження лінтера)
     top_verdict = "UNIQUE"
     status_text = "Оригінальна ініціатива"
     top_score = 0.0
@@ -254,24 +297,24 @@ def check_petition_endpoint(payload: PetitionCheckRequest):
 
     if not results_df.empty:
         top_record = results_df.iloc[0]
-        top_score = float(top_record.get('final_score', 0.0))
-        top_verdict = str(top_record.get('verdict', 'UNIQUE'))
-        status_text = str(top_record.get('status_text', 'Оригінальна ініціатива'))
+        top_score = float(top_record.get("final_score", 0.0))
+        top_verdict = str(top_record.get("verdict", "UNIQUE"))
+        status_text = str(top_record.get("status_text", "Оригінальна ініціатива"))
 
-        # Форматування списку знайдених аналогів
         for _, row in results_df.iterrows():
-            matches_list.append(MatchItem(
-                title=str(row.get('title', 'Без назви')),
-                authority=str(row.get('authority', 'Не вказано')),
-                author=str(row.get('author', 'Невідомий')),
-                base_score=float(row.get('base_score', 0.0)),
-                final_score=float(row.get('final_score', 0.0)),
-                verdict=str(row.get('verdict', 'UNIQUE')),
-                status_text=str(row.get('status_text', '')),
-                reasons=row.get('reasons', []) if isinstance(row.get('reasons'), list) else []
-            ))
+            matches_list.append(
+                MatchItem(
+                    title=str(row.get("title", "Без назви")),
+                    authority=str(row.get("authority", "Не вказано")),
+                    author=str(row.get("author", "Невідомий")),
+                    base_score=float(row.get("base_score", 0.0)),
+                    final_score=float(row.get("final_score", 0.0)),
+                    verdict=str(row.get("verdict", "UNIQUE")),
+                    status_text=str(row.get("status_text", "")),
+                    reasons=row.get("reasons", []) if isinstance(row.get("reasons"), list) else [],
+                )
+            )
 
-    # Зберігаємо результати у базу даних SQLite
     try:
         log_petition_check(
             query_title=payload.title,
@@ -284,7 +327,7 @@ def check_petition_endpoint(payload: PetitionCheckRequest):
             status_text=status_text,
             top_score=top_score,
             candidates_evaluated=candidates_count,
-            latency_ms=latency_ms
+            latency_ms=latency_ms,
         )
     except Exception as db_err:
         logger.error(f"⚠️ Не вдалося записати лог у базу даних: {db_err}")
@@ -300,21 +343,21 @@ def check_petition_endpoint(payload: PetitionCheckRequest):
         "matches_count": len(matches_list),
         "latency_ms": latency_ms,
         "candidates_evaluated": candidates_count,
-        "similar_petitions": matches_list
+        "similar_petitions": matches_list,
     }
 
 
 @app.post("/api/v1/export/pdf", tags=["Експорт звітів"])
 def export_pdf_report(payload: PetitionCheckRequest):
     """
-    Генерує та повертає офіційний експертний PDF-протокол перевірки звернення 
+    Генерує та повертає офіційний експертний PDF-протокол перевірки звернення
     з деталізацією причин коригування та списком знайдених аналогів.
     """
     if df_corpus is None or model is None:
         raise HTTPException(status_code=500, detail="Системні ресурси не ініціалізовано.")
 
     full_query = f"{payload.title.strip()}. {payload.body.strip()}".strip()
-    
+
     results_df = search_similar_petitions(
         query_text=full_query,
         df_corpus=df_corpus,
@@ -324,7 +367,10 @@ def export_pdf_report(payload: PetitionCheckRequest):
         strict_mode=payload.strict_mode,
         top_k=payload.top_k,
         threshold_duplicate=payload.threshold_duplicate,
-        threshold_review=payload.threshold_review
+        threshold_review=payload.threshold_review,
+        w_sem=payload.w_sem,
+        w_dom=payload.w_dom,
+        w_geod=payload.w_geod,
     )
 
     top_verdict = "Оригінальна ініціатива"
@@ -337,16 +383,16 @@ def export_pdf_report(payload: PetitionCheckRequest):
             query_body=payload.body,
             authority=payload.authority,
             results_df=results_df,
-            top_verdict=top_verdict
+            top_verdict=top_verdict,
         )
     except Exception as e:
-        logger.exception("❌ Помилка генерації PDF-протоколу")
+        logger.exception("Помилка генерації PDF-протоколу")
         raise HTTPException(status_code=500, detail=f"Не вдалося згенерувати PDF: {str(e)}")
 
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": "attachment; filename=petition_audit_protocol.pdf"}
+        headers={"Content-Disposition": "attachment; filename=petition_audit_protocol.pdf"},
     )
 
 
@@ -357,7 +403,7 @@ def export_csv_report(payload: PetitionCheckRequest):
         raise HTTPException(status_code=500, detail="Системні ресурси не ініціалізовано.")
 
     full_query = f"{payload.title.strip()}. {payload.body.strip()}".strip()
-    
+
     results_df = search_similar_petitions(
         query_text=full_query,
         df_corpus=df_corpus,
@@ -365,7 +411,12 @@ def export_csv_report(payload: PetitionCheckRequest):
         corpus_embeddings=corpus_embeddings,
         selected_authority=payload.authority,
         strict_mode=payload.strict_mode,
-        top_k=payload.top_k
+        top_k=payload.top_k,
+        threshold_duplicate=payload.threshold_duplicate,
+        threshold_review=payload.threshold_review,
+        w_sem=payload.w_sem,
+        w_dom=payload.w_dom,
+        w_geod=payload.w_geod,
     )
 
     try:
@@ -376,7 +427,7 @@ def export_csv_report(payload: PetitionCheckRequest):
     return Response(
         content=csv_bytes,
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=petition_audit_results.csv"}
+        headers={"Content-Disposition": "attachment; filename=petition_audit_results.csv"},
     )
 
 
@@ -399,24 +450,23 @@ def batch_check_petitions(payload: BatchPetitionCheckRequest):
     for item in payload.petitions:
         item_start_time = time.perf_counter()
 
-        # 1. Валідація тексту
         is_valid, validation_msg = is_valid_input_text(item.title)
         if not is_valid:
-            results_list.append(BatchItemResult(
-                query_title=item.title,
-                top_verdict="INVALID",
-                status_text=validation_msg,
-                top_score=0.0,
-                matches_count=0,
-                latency_ms=round((time.perf_counter() - item_start_time) * 1000, 1),
-                similar_petitions=[]
-            ))
+            results_list.append(
+                BatchItemResult(
+                    query_title=item.title,
+                    top_verdict="INVALID",
+                    status_text=validation_msg,
+                    top_score=0.0,
+                    matches_count=0,
+                    latency_ms=round((time.perf_counter() - item_start_time) * 1000, 1),
+                    similar_petitions=[],
+                )
+            )
             continue
 
-        # 2. Формування повного запиту
         full_query = f"{item.title.strip()}. {item.body.strip()}".strip()
 
-        # 3. Пошук та переранжування
         try:
             results_df = search_similar_petitions(
                 query_text=full_query,
@@ -427,21 +477,33 @@ def batch_check_petitions(payload: BatchPetitionCheckRequest):
                 strict_mode=item.strict_mode,
                 top_k=item.top_k,
                 threshold_duplicate=item.threshold_duplicate,
-                threshold_review=item.threshold_review
+                threshold_review=item.threshold_review,
+                w_sem=item.w_sem,
+                w_dom=item.w_dom,
+                w_geod=item.w_geod,
             )
         except Exception as e:
-            logger.error(f"❌ Помилка під час обробки петиції у пакеті '{item.title}': {e}")
+            logger.error(f"Помилка під час обробки петиції у пакеті '{item.title}': {e}")
+            results_list.append(
+                BatchItemResult(
+                    query_title=item.title,
+                    top_verdict="ERROR",
+                    status_text=f"Помилка обробки: {str(e)}",
+                    top_score=0.0,
+                    matches_count=0,
+                    latency_ms=round((time.perf_counter() - item_start_time) * 1000, 1),
+                    similar_petitions=[],
+                )
+            )
             continue
 
         latency_ms = round((time.perf_counter() - item_start_time) * 1000, 1)
 
-        # Підрахунок кандидатів у межах юрисдикції
         df_scope = df_scope_global.copy()
         if item.strict_mode and item.authority != "Всі юрисдикції (Національний рівень)":
-            df_scope = df_scope[df_scope['authority'] == item.authority]
+            df_scope = df_scope[df_scope["authority"] == item.authority]
         candidates_count = len(df_scope)
 
-        # Значення за замовчуванням
         top_verdict = "UNIQUE"
         status_text = "Оригінальна ініціатива"
         top_score = 0.0
@@ -449,23 +511,24 @@ def batch_check_petitions(payload: BatchPetitionCheckRequest):
 
         if not results_df.empty:
             top_record = results_df.iloc[0]
-            top_score = float(top_record.get('final_score', 0.0))
-            top_verdict = str(top_record.get('verdict', 'UNIQUE'))
-            status_text = str(top_record.get('status_text', 'Оригінальна ініціатива'))
+            top_score = float(top_record.get("final_score", 0.0))
+            top_verdict = str(top_record.get("verdict", "UNIQUE"))
+            status_text = str(top_record.get("status_text", "Оригінальна ініціатива"))
 
             for _, row in results_df.iterrows():
-                matches_list.append(MatchItem(
-                    title=str(row.get('title', 'Без назви')),
-                    authority=str(row.get('authority', 'Не вказано')),
-                    author=str(row.get('author', 'Невідомий')),
-                    base_score=float(row.get('base_score', 0.0)),
-                    final_score=float(row.get('final_score', 0.0)),
-                    verdict=str(row.get('verdict', 'UNIQUE')),
-                    status_text=str(row.get('status_text', '')),
-                    reasons=row.get('reasons', []) if isinstance(row.get('reasons'), list) else []
-                ))
+                matches_list.append(
+                    MatchItem(
+                        title=str(row.get("title", "Без назви")),
+                        authority=str(row.get("authority", "Не вказано")),
+                        author=str(row.get("author", "Невідомий")),
+                        base_score=float(row.get("base_score", 0.0)),
+                        final_score=float(row.get("final_score", 0.0)),
+                        verdict=str(row.get("verdict", "UNIQUE")),
+                        status_text=str(row.get("status_text", "")),
+                        reasons=row.get("reasons", []) if isinstance(row.get("reasons"), list) else [],
+                    )
+                )
 
-        # 📌 Логування кожного елемента пакету в SQLite для статистики
         try:
             log_petition_check(
                 query_title=item.title,
@@ -478,20 +541,22 @@ def batch_check_petitions(payload: BatchPetitionCheckRequest):
                 status_text=status_text,
                 top_score=top_score,
                 candidates_evaluated=candidates_count,
-                latency_ms=latency_ms
+                latency_ms=latency_ms,
             )
         except Exception as db_err:
             logger.error(f"⚠️ Не вдалося записати пакетний лог у базу: {db_err}")
 
-        results_list.append(BatchItemResult(
-            query_title=item.title,
-            top_verdict=top_verdict,
-            status_text=status_text,
-            top_score=top_score,
-            matches_count=len(matches_list),
-            latency_ms=latency_ms,
-            similar_petitions=matches_list
-        ))
+        results_list.append(
+            BatchItemResult(
+                query_title=item.title,
+                top_verdict=top_verdict,
+                status_text=status_text,
+                top_score=top_score,
+                matches_count=len(matches_list),
+                latency_ms=latency_ms,
+                similar_petitions=matches_list,
+            )
+        )
 
     total_latency_ms = round((time.perf_counter() - batch_start_time) * 1000, 1)
     logger.info(f"Processed batch of {len(results_list)} petitions in {total_latency_ms}ms")
@@ -500,7 +565,7 @@ def batch_check_petitions(payload: BatchPetitionCheckRequest):
         success=True,
         total_processed=len(results_list),
         total_latency_ms=total_latency_ms,
-        results=results_list
+        results=results_list,
     )
 
 
@@ -519,55 +584,50 @@ def get_semantic_clusters(
         raise HTTPException(status_code=500, detail="Корпус даних або ембединги не ініціалізовані.")
 
     try:
-        # Конвертуємо тензор PyTorch у масив NumPy
         embeddings_np = corpus_embeddings.cpu().numpy()
         total_records = len(df_corpus)
 
         if total_records < n_clusters:
             raise HTTPException(status_code=400, detail="Кількість записів у корпусі менша за бажану кількість кластерів.")
 
-        # Запускаємо алгоритм K-Means кластеризації
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         cluster_labels = kmeans.fit_predict(embeddings_np)
 
-        # Додаємо мітки кластерів до копії датафрейму
         df_clustered = df_corpus.copy()
-        df_clustered['cluster'] = cluster_labels
+        df_clustered["cluster"] = cluster_labels
 
         clusters_result = []
         for cluster_id in range(n_clusters):
-            cluster_subset = df_clustered[df_clustered['cluster'] == cluster_id]
+            cluster_subset = df_clustered[df_clustered["cluster"] == cluster_id]
             count = len(cluster_subset)
             percentage = round((count / total_records) * 100, 2)
+            sample_titles = cluster_subset["title"].head(3).tolist()
 
-            # Беремо до 3 характерних заголовків петицій як приклади теми
-            sample_titles = cluster_subset['title'].head(3).tolist()
+            clusters_result.append(
+                ClusterInfo(
+                    cluster_id=cluster_id,
+                    petition_count=count,
+                    percentage=percentage,
+                    sample_titles=sample_titles,
+                )
+            )
 
-            clusters_result.append(ClusterInfo(
-                cluster_id=cluster_id,
-                petition_count=count,
-                percentage=percentage,
-                sample_titles=sample_titles
-            ))
-
-        # Сортуємо кластери за кількістю петицій (від найбільшої проблеми до найменшої)
         clusters_result = sorted(clusters_result, key=lambda x: x.petition_count, reverse=True)
-
         logger.info(f"Successfully clustered {total_records} petitions into {n_clusters} semantic groups.")
 
         return ClustersResponse(
             success=True,
             total_clusters=n_clusters,
             total_petitions=total_records,
-            clusters=clusters_result
+            clusters=clusters_result,
         )
 
     except Exception as e:
-        logger.exception("❌ Помилка під час семантичної кластеризації корпусу")
+        logger.exception("Помилка під час семантичної кластеризації корпусу!")
         raise HTTPException(status_code=500, detail=f"Помилка кластеризації: {str(e)}")
 
 
-@app.post("/api/v1/feedback", response_model=FeedbackResponse, tags=["Active Learning та Модерація"])
+@app.post("/api/v1/feedback", response_model=FeedbackResponse, tags=["Active Learning та Мoderation"])
 def submit_expert_feedback(payload: FeedbackRequest):
     """
     Модуль зворотного зв'язку (Active Learning / Human-in-the-Loop):
@@ -580,18 +640,21 @@ def submit_expert_feedback(payload: FeedbackRequest):
             query_title=payload.query_title,
             matched_title=payload.matched_title,
             is_duplicate=payload.is_duplicate,
-            comment=payload.comment
+            comment=payload.comment,
         )
-        logger.info(f"✅ Отримано експертний фідбек: дублікат = {payload.is_duplicate} для пари '{payload.query_title}' / '{payload.matched_title}'")
-        
+        logger.info(
+            f"✅ Отримано експертний фідбек: дублікат = {payload.is_duplicate} "
+            f"для пари '{payload.query_title}' / '{payload.matched_title}'"
+        )
+
         return FeedbackResponse(
             success=True,
-            message="Експертну оцінку успішно збережено в корпус Ground Truth."
+            message="Експертну оцінку успішно збережено в корпус Ground Truth.",
         )
     except Exception as e:
-        logger.exception("❌ Помилка під час збереження фідбеку модератора")
+        logger.exception("Помилка під час збереження фідбеку модератора!")
         raise HTTPException(status_code=500, detail=f"Не вдалося зберегти фідбек: {str(e)}")
-     
+
 
 @app.get("/api/v1/export/geojson", tags=["Геопросторовий аналіз та Експорт"])
 def export_geojson_endpoint(
@@ -609,42 +672,40 @@ def export_geojson_endpoint(
 
     try:
         df_subset = df_corpus.copy()
-        
-        # Фільтрація за ОМС, якщо вказано параметр
+
         if authority and authority != "Всі юрисдикції (Національний рівень)":
-            df_subset = df_subset[df_subset['authority'] == authority]
+            df_subset = df_subset[df_subset["authority"] == authority]
 
         features = []
         for _, row in df_subset.iterrows():
-            # Перевіряємо наявність координат у датасеті (або використовуємо дефолтні геомітки центру міста, наприклад Львова чи відповідного регіону)
-            lat = float(row.get('latitude', 49.8397))  # За замовчуванням центр Львова, якщо координати відсутні
-            lon = float(row.get('longitude', 24.0297))
+            lat = float(row.get("latitude", 49.8397))
+            lon = float(row.get("longitude", 24.0297))
 
             feature = {
                 "type": "Feature",
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [lon, lat]  # У форматі GeoJSON спочатку йде довгота (longitude), потім широта (latitude)
+                    "coordinates": [lon, lat],
                 },
                 "properties": {
-                    "title": str(row.get('title', 'Без назви')),
-                    "authority": str(row.get('authority', 'Не вказано')),
-                    "author": str(row.get('author', 'Невідомий')),
-                    "category": str(row.get('category', 'Інфраструктура'))
-                }
+                    "title": str(row.get("title", "Без назви")),
+                    "authority": str(row.get("authority", "Не вказано")),
+                    "author": str(row.get("author", "Невідомий")),
+                    "category": str(row.get("category", "Інфраструктура")),
+                },
             }
             features.append(feature)
 
         geojson_collection = {
             "type": "FeatureCollection",
-            "features": features
+            "features": features,
         }
 
         logger.info(f"Successfully generated GeoJSON with {len(features)} spatial features.")
         return geojson_collection
 
     except Exception as e:
-        logger.exception("❌ Помилка під час генерації GeoJSON-експорту")
+        logger.exception("Помилка під час генерації GeoJSON-експорту")
         raise HTTPException(status_code=500, detail=f"Помилка експорту геоданих: {str(e)}")
 
 
@@ -654,5 +715,5 @@ def get_analytics_summary():
     stats = get_system_analytics()
     return {
         "success": True,
-        "analytics": stats
+        "analytics": stats,
     }
